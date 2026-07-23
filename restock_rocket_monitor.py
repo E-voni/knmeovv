@@ -58,7 +58,7 @@ ENTRY_PATTERN = re.compile(
 )
 
 TARGET_FIELD = "variantsPreorderCount"
-CSV_HEADER = ["timestamp_utc", "variant_id", "销量", "销量变化"]
+CSV_HEADER = ["timestamp_utc", "销量", "销量变化"]
 
 
 def fetch_html(url: str, timeout: int = 15) -> str:
@@ -105,31 +105,29 @@ def ensure_csv_header(csv_path: str):
             writer.writerow(CSV_HEADER)
 
 
-def read_last_value(csv_path: str, variant_id: str):
-    """从已有 CSV 里找这个 variant_id 最后一次记录的销量值，没有则返回 None"""
+def read_last_value(csv_path: str):
+    """从已有 CSV 里读最后一行记录的销量值，没有则返回 None"""
     if not os.path.exists(csv_path):
         return None
     last_value = None
     with open(csv_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            if row.get("variant_id") == str(variant_id):
-                raw = row.get("销量", "")
-                if raw not in ("", None):
-                    try:
-                        last_value = int(raw)
-                    except ValueError:
-                        pass
+            raw = row.get("销量", "")
+            if raw not in ("", None):
+                try:
+                    last_value = int(raw)
+                except ValueError:
+                    pass
     return last_value
 
 
-def append_csv_row(csv_path: str, variant_id: str, value, diff):
+def append_csv_row(csv_path: str, value, diff):
     with open(csv_path, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(
             [
                 datetime.now(timezone.utc).isoformat(),
-                variant_id,
                 "" if value is None else value,
                 "" if diff is None else diff,
             ]
@@ -140,7 +138,7 @@ def monitor(url: str, variant_id: str, interval: int, csv_path: str, once: bool)
     ensure_csv_header(csv_path)
     # 每次进程启动都从 CSV 里读上一次的值，这样即使脚本是被 GitHub Actions
     # 每次全新启动一次（--once 模式），也能正确算出差额
-    last_value = read_last_value(csv_path, variant_id)
+    last_value = read_last_value(csv_path)
 
     while True:
         try:
@@ -161,7 +159,7 @@ def monitor(url: str, variant_id: str, interval: int, csv_path: str, once: bool)
                 f"[{datetime.now().isoformat()}] 销量更新: "
                 f"{last_value} -> {current_value} (变化 {diff})"
             )
-            append_csv_row(csv_path, variant_id, current_value, diff)
+            append_csv_row(csv_path, current_value, diff)
             last_value = current_value
         else:
             print(f"[{datetime.now().isoformat()}] 销量无变化，当前值 = {current_value}")
