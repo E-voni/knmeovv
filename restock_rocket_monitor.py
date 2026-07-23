@@ -111,6 +111,9 @@ def extract_variant_snapshot(config: dict, variant_id: str) -> dict:
 
 
 def ensure_csv_header(csv_path: str):
+    parent_dir = os.path.dirname(csv_path)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
     if not os.path.exists(csv_path):
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
