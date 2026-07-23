@@ -3,9 +3,10 @@
 """
 restock_rocket_monitor.py
 
-实时抓取 Shopify 商品页面中 RestockRocket 插件注入的
-window._RestockRocketConfig 数据（预售数量、库存、预售上限等），
-按固定间隔轮询，打印变化并追加写入 CSV。
+抓取 Shopify 商品页面中 RestockRocket 插件注入的
+window._RestockRocketConfig.variantsPreorderCount 字段（记为"销量"），
+每次抓取到的值如果和上一次记录的不同，就追加一行到 CSV，
+并自动计算本次和上一次的差额（销量变化）。
 
 用法示例:
     python3 restock_rocket_monitor.py \
@@ -13,6 +14,9 @@ window._RestockRocketConfig 数据（预售数量、库存、预售上限等）�
         --variant-id 48960796590315 \
         --interval 60 \
         --csv preorder_log.csv
+
+只抓一次（配合 GitHub Actions / cron 使用）:
+    python3 restock_rocket_monitor.py --url ... --variant-id ... --csv ... --once
 
 依赖:
     pip install requests --break-system-packages
@@ -30,7 +34,6 @@ import requests
 
 # 匹配形如:
 #   window._RestockRocketConfig.variantsPreorderCount = {48960796590315 : parseInt("235"),};
-# 的赋值语句，字段名可变（variantsPreorderCount / variantsInventoryQuantity / ...）
 FIELD_PATTERN = re.compile(
     r"_RestockRocketConfig\.(?P<field>\w+)\s*=\s*\{(?P<body>.*?)\}\s*;",
     re.DOTALL,
@@ -54,16 +57,8 @@ ENTRY_PATTERN = re.compile(
     re.VERBOSE,
 )
 
-FIELDS_OF_INTEREST = [
-    "variantsInventoryPolicy",
-    "variantsInventoryQuantity",
-    "variantsPreorderCount",
-    "variantsPreorderCountForMarket",
-    "variantsPreorderMaxCount",
-    "variantsPreorderMaxCountForMarket",
-    "variantsShippingText",
-    "variantsShippingTextForMarket",
-]
+TARGET_FIELD = "variantsPreorderCount"
+CSV_HEADER = ["timestamp_utc", "variant_id", "销量", "销量变化"]
 
 
 def fetch_html(url: str, timeout: int = 15) -> str:
@@ -79,35 +74,25 @@ def fetch_html(url: str, timeout: int = 15) -> str:
     return resp.text
 
 
-def parse_config(html: str) -> dict:
-    """解析出 { field_name: { variant_id(str): value, ... }, ... }"""
-    result = {}
+def parse_preorder_count(html: str, variant_id: str):
+    """从 HTML 中解析出目标 variant 的 variantsPreorderCount 值（int 或 None）"""
     for m in FIELD_PATTERN.finditer(html):
-        field = m.group("field")
-        if field not in FIELDS_OF_INTEREST:
+        if m.group("field") != TARGET_FIELD:
             continue
         body = m.group("body")
-        entries = {}
         for em in ENTRY_PATTERN.finditer(body):
-            key = em.group("key")
+            if em.group("key") != variant_id:
+                continue
             if em.group("num_str") is not None:
-                entries[key] = int(em.group("num_str"))
-            elif em.group("null") is not None:
-                entries[key] = None
-            elif em.group("str_val") is not None:
-                entries[key] = em.group("str_val")
-            elif em.group("raw_num") is not None:
-                entries[key] = int(em.group("raw_num"))
-        result[field] = entries
-    return result
-
-
-def extract_variant_snapshot(config: dict, variant_id: str) -> dict:
-    snapshot = {}
-    for field in FIELDS_OF_INTEREST:
-        entries = config.get(field, {})
-        snapshot[field] = entries.get(variant_id)
-    return snapshot
+                return int(em.group("num_str"))
+            if em.group("raw_num") is not None:
+                return int(em.group("raw_num"))
+            if em.group("null") is not None:
+                return None
+            if em.group("str_val") is not None:
+                # 理论上不会出现，容错返回 None
+                return None
+    return None
 
 
 def ensure_csv_header(csv_path: str):
@@ -117,31 +102,50 @@ def ensure_csv_header(csv_path: str):
     if not os.path.exists(csv_path):
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["timestamp_utc", "variant_id"] + FIELDS_OF_INTEREST)
+            writer.writerow(CSV_HEADER)
 
 
-def append_csv_row(csv_path: str, variant_id: str, snapshot: dict):
+def read_last_value(csv_path: str, variant_id: str):
+    """从已有 CSV 里找这个 variant_id 最后一次记录的销量值，没有则返回 None"""
+    if not os.path.exists(csv_path):
+        return None
+    last_value = None
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row.get("variant_id") == str(variant_id):
+                raw = row.get("销量", "")
+                if raw not in ("", None):
+                    try:
+                        last_value = int(raw)
+                    except ValueError:
+                        pass
+    return last_value
+
+
+def append_csv_row(csv_path: str, variant_id: str, value, diff):
     with open(csv_path, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(
-            [datetime.now(timezone.utc).isoformat(), variant_id]
-            + [snapshot.get(field) for field in FIELDS_OF_INTEREST]
+            [
+                datetime.now(timezone.utc).isoformat(),
+                variant_id,
+                "" if value is None else value,
+                "" if diff is None else diff,
+            ]
         )
-
-
-def format_snapshot(snapshot: dict) -> str:
-    return " | ".join(f"{k}={v}" for k, v in snapshot.items())
 
 
 def monitor(url: str, variant_id: str, interval: int, csv_path: str, once: bool):
     ensure_csv_header(csv_path)
-    last_snapshot = None
+    # 每次进程启动都从 CSV 里读上一次的值，这样即使脚本是被 GitHub Actions
+    # 每次全新启动一次（--once 模式），也能正确算出差额
+    last_value = read_last_value(csv_path, variant_id)
 
     while True:
         try:
             html = fetch_html(url)
-            config = parse_config(html)
-            snapshot = extract_variant_snapshot(config, variant_id)
+            current_value = parse_preorder_count(html, variant_id)
         except Exception as e:
             print(f"[{datetime.now().isoformat()}] 抓取/解析失败: {e}", file=sys.stderr)
             if once:
@@ -149,12 +153,18 @@ def monitor(url: str, variant_id: str, interval: int, csv_path: str, once: bool)
             time.sleep(interval)
             continue
 
-        if snapshot != last_snapshot:
-            print(f"[{datetime.now().isoformat()}] 数据变化 -> {format_snapshot(snapshot)}")
-            append_csv_row(csv_path, variant_id, snapshot)
-            last_snapshot = snapshot
+        if current_value != last_value:
+            diff = None
+            if current_value is not None and last_value is not None:
+                diff = current_value - last_value
+            print(
+                f"[{datetime.now().isoformat()}] 销量更新: "
+                f"{last_value} -> {current_value} (变化 {diff})"
+            )
+            append_csv_row(csv_path, variant_id, current_value, diff)
+            last_value = current_value
         else:
-            print(f"[{datetime.now().isoformat()}] 无变化 -> {format_snapshot(snapshot)}")
+            print(f"[{datetime.now().isoformat()}] 销量无变化，当前值 = {current_value}")
 
         if once:
             break
@@ -162,7 +172,7 @@ def monitor(url: str, variant_id: str, interval: int, csv_path: str, once: bool)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="实时抓取 RestockRocket 预售/库存数据")
+    parser = argparse.ArgumentParser(description="实时抓取 RestockRocket 销量(预售数量)数据")
     parser.add_argument("--url", required=True, help="商品页面完整 URL")
     parser.add_argument("--variant-id", required=True, help="要监控的 variant id")
     parser.add_argument("--interval", type=int, default=60, help="轮询间隔（秒），默认 60")
